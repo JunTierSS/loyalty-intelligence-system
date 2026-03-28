@@ -3,7 +3,13 @@ Loyalty Intelligence System — Pipeline de Scoring Mensual
 Fase 3: Productizacion
 
 Ejecuta scoring mensual sobre los 12M clientes de produccion en chunks.
-Pipeline: BigQuery → Chunks 1M → Modelo (XGBoost + Clustering + Uplift) → BigQuery
+Pipeline: BigQuery → Chunks 1M → Cascade (4 XGBoost) + Clustering + Uplift → BigQuery
+
+Cascade:
+  Paso 1: XGBoost ternary (y=0/1/2) → P(no canje), P(activacion), P(recurrencia)
+  Paso 2: XGBoost multiclass → retailer recomendado (canjeadores)
+  Paso 3: XGBoost regressor → monto puntos estimado (canjeadores)
+  Paso 4: Two-stage XGBoost → estimated revenue (Stage A: P(revenue>0), Stage B: log-regression)
 
 Uso:
   # Mock local
@@ -62,15 +68,23 @@ def parse_args():
 def load_or_train_models(df_train, save=False):
     """Train all models on training data, or load from disk if available."""
     from sklearn.cluster import KMeans
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import StandardScaler, OrdinalEncoder, LabelEncoder
     from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import StratifiedKFold
     import xgboost as xgb
 
     models = {}
 
+    # ── Save target columns for cascade training BEFORE dropping post-t0 ──
+    CASCADE_TARGET_COLS = ["retailer_post", "monto_redeem_post", "revenue_post_12m"]
+    cascade_targets = {}
+    for col in CASCADE_TARGET_COLS:
+        if col in df_train.columns:
+            cascade_targets[col] = df_train[col].copy()
+
     # ── Drop post-t0 columns to prevent accidental leakage ──
     POST_T0_COLS = ["revenue_post_12m", "spending_post_6m", "txn_count_post_6m",
-                    "canjea_post", "n_canjes_post"]
+                    "canjea_post", "n_canjes_post", "retailer_post", "monto_redeem_post"]
     leaked = [c for c in POST_T0_COLS if c in df_train.columns]
     if leaked:
         log.info(f"Dropping post-t0 columns from training data: {leaked}")
@@ -162,7 +176,58 @@ def load_or_train_models(df_train, save=False):
     for k, v in cluster_names.items():
         log.info(f"  Cluster {k} = {v}")
 
-    # ── Propensity (cross-fitted to avoid using target directly) ──
+    # ── Feature setup for cascade (matching notebook 01/02) ──
+    CATEGORICAL_FEATURES = ["tier", "gender", "city", "dominant_retailer",
+                            "funnel_state_at_t0", "status"]
+    BOOLEAN_FEATURES = [
+        "cust_active_store_card_flg", "cust_active_deb_flg", "cust_active_omp_flg",
+        "contact_email_flg", "contact_phone_flg", "contact_push_flg",
+        "redeem_capacity", "is_cyber_month", "is_holiday_month",
+    ]
+    ID_COLS = ["cust_id", "t0", "fecha_proceso"]
+    TARGET_RELATED = ["has_redeemed_before_t0", "canjea_post", "n_canjes_post",
+                      "revenue_post_12m", "retailer_post", "monto_redeem_post",
+                      "spending_post_6m", "txn_count_post_6m"]
+    EXCLUDED = set(ID_COLS + ["y"] + TARGET_RELATED + CATEGORICAL_FEATURES + BOOLEAN_FEATURES)
+    cat_avail = [f for f in CATEGORICAL_FEATURES if f in df_train.columns]
+    bool_avail = [f for f in BOOLEAN_FEATURES if f in df_train.columns]
+    num_avail = [c for c in df_train.columns if c not in EXCLUDED and c not in CATEGORICAL_FEATURES and c not in BOOLEAN_FEATURES]
+    FEATURE_COLS = cat_avail + bool_avail + num_avail
+
+    # Ordinal encode categoricals (fit on train only)
+    ord_enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+    df_train[cat_avail] = ord_enc.fit_transform(df_train[cat_avail])
+    for col in bool_avail:
+        df_train[col] = df_train[col].astype(int)
+
+    models["ordinal_encoder"] = ord_enc
+    models["cat_features"] = cat_avail
+    models["bool_features"] = bool_avail
+    models["cascade_features"] = FEATURE_COLS
+    log.info(f"Cascade features: {len(FEATURE_COLS)} ({len(cat_avail)} cat, {len(bool_avail)} bool, {len(num_avail)} num)")
+
+    # ── Paso 1: XGBoost ternary classification (y=0/1/2) ──
+    y_target = df_train["y"].values.astype(int) if "y" in df_train.columns else np.zeros(len(df_train), dtype=int)
+    X_cascade = df_train[FEATURE_COLS].values.astype(np.float32)
+
+    # Class weights (inverse frequency)
+    vc = pd.Series(y_target).value_counts()
+    n_cls = len(vc)
+    weight_map = {cls: len(y_target) / (n_cls * count) for cls, count in vc.items()}
+    w_train = np.array([weight_map[y] for y in y_target])
+
+    model1 = xgb.XGBClassifier(
+        objective="multi:softprob", num_class=3, tree_method="hist",
+        eval_metric="mlogloss", n_estimators=500, max_depth=6,
+        learning_rate=0.03, subsample=0.9, colsample_bytree=0.6,
+        min_child_weight=5, gamma=0.1, reg_alpha=0.5, reg_lambda=0.01,
+        random_state=42, verbosity=0,
+    )
+    model1.fit(X_cascade, y_target, sample_weight=w_train)
+    models["cascade_paso1"] = model1
+    log.info(f"Paso 1 (ternary): trained on {len(X_cascade):,} rows, classes={sorted(vc.index.tolist())}")
+
+    # ── Propensity (cross-fitted, for uplift) ──
     PSM_FEATURES = [
         "frequency_monthly_avg", "monetary_monthly_avg", "redeem_rate",
         "retailer_entropy", "pct_redeem_digital", "earn_velocity_90",
@@ -172,8 +237,6 @@ def load_or_train_models(df_train, save=False):
     psm_avail = [f for f in PSM_FEATURES if f in df_train.columns]
     treatment = (df_train["y"] >= 1).astype(int) if "y" in df_train.columns else pd.Series(0, index=df_train.index)
 
-    # Cross-fitted propensity: train on odd-indexed rows, predict on even, and vice versa
-    from sklearn.model_selection import StratifiedKFold
     X_psm = df_train[psm_avail].fillna(0)
     prop_scores = np.zeros(len(df_train))
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -182,7 +245,6 @@ def load_or_train_models(df_train, save=False):
         fold_model.fit(X_psm.iloc[train_idx], treatment.iloc[train_idx])
         prop_scores[val_idx] = fold_model.predict_proba(X_psm.iloc[val_idx])[:, 1]
 
-    # Final model on all data for scoring new customers
     prop_model = LogisticRegression(max_iter=1000, random_state=42)
     prop_model.fit(X_psm, treatment)
     models["propensity_model"] = prop_model
@@ -220,6 +282,98 @@ def load_or_train_models(df_train, save=False):
     else:
         log.warning("Not enough treated/control for uplift model")
 
+    # ── Paso 2: Retailer prediction (canjeadores only) ──
+    RETAILERS_TARGET = ["STOREA", "STOREB", "STOREC", "STORED"]
+    if "retailer_post" in cascade_targets:
+        retailer_series = cascade_targets["retailer_post"]
+        mask_ret = retailer_series.isin(RETAILERS_TARGET)
+        if mask_ret.sum() > 20:
+            le_ret = LabelEncoder()
+            le_ret.fit(RETAILERS_TARGET)
+            X_ret = df_train.loc[mask_ret, FEATURE_COLS].values.astype(np.float32)
+            y_ret = le_ret.transform(retailer_series[mask_ret])
+            # Class weights
+            vc_ret = pd.Series(y_ret).value_counts()
+            w_map_ret = {c: len(y_ret) / (len(vc_ret) * n) for c, n in vc_ret.items()}
+            w_ret = np.array([w_map_ret[y] for y in y_ret])
+
+            model2 = xgb.XGBClassifier(
+                objective="multi:softprob", num_class=len(RETAILERS_TARGET),
+                tree_method="hist", eval_metric="mlogloss",
+                n_estimators=500, max_depth=6, learning_rate=0.03,
+                subsample=0.9, colsample_bytree=0.6, min_child_weight=5,
+                random_state=42, verbosity=0,
+            )
+            model2.fit(X_ret, y_ret, sample_weight=w_ret)
+            models["cascade_paso2"] = model2
+            models["retailer_encoder"] = le_ret
+            models["retailers_target"] = RETAILERS_TARGET
+            log.info(f"Paso 2 (retailer): trained on {mask_ret.sum():,} canjeadores, classes={RETAILERS_TARGET}")
+        else:
+            log.warning("Not enough canjeadores for Paso 2 retailer model")
+    else:
+        log.warning("retailer_post column not available, skipping Paso 2")
+
+    # ── Paso 3: Amount regression (canjeadores with monto > 0) ──
+    if "monto_redeem_post" in cascade_targets:
+        monto_series = cascade_targets["monto_redeem_post"]
+        mask_monto = monto_series.notna() & (monto_series > 0)
+        if mask_monto.sum() > 20:
+            X_monto = df_train.loc[mask_monto, FEATURE_COLS].values.astype(np.float32)
+            y_monto = monto_series[mask_monto].values.astype(np.float32)
+
+            model3 = xgb.XGBRegressor(
+                objective="reg:squarederror", tree_method="hist",
+                n_estimators=500, max_depth=6, learning_rate=0.03,
+                subsample=0.9, colsample_bytree=0.6, min_child_weight=5,
+                random_state=42, verbosity=0,
+            )
+            model3.fit(X_monto, y_monto)
+            models["cascade_paso3"] = model3
+            log.info(f"Paso 3 (amount): trained on {mask_monto.sum():,} rows, mean={y_monto.mean():,.0f}")
+        else:
+            log.warning("Not enough data for Paso 3 amount model")
+    else:
+        log.warning("monto_redeem_post column not available, skipping Paso 3")
+
+    # ── Paso 4: Two-stage revenue (Stage A: binary, Stage B: log-regression) ──
+    if "revenue_post_12m" in cascade_targets:
+        y_rev = cascade_targets["revenue_post_12m"].fillna(0).values
+        y_rev_bin = (y_rev > 0).astype(int)
+        mask_rev_pos = y_rev > 0
+
+        if mask_rev_pos.sum() > 20:
+            # Stage A: P(revenue > 0)
+            X_rev = df_train[FEATURE_COLS].values.astype(np.float32)
+            spw = max(1.0, (~mask_rev_pos).sum() / mask_rev_pos.sum())  # scale_pos_weight
+            model4a = xgb.XGBClassifier(
+                objective="binary:logistic", tree_method="hist", eval_metric="auc",
+                n_estimators=400, max_depth=5, learning_rate=0.03,
+                subsample=0.9, colsample_bytree=0.6, scale_pos_weight=min(spw, 5.0),
+                random_state=42, verbosity=0,
+            )
+            model4a.fit(X_rev, y_rev_bin)
+
+            # Stage B: log1p(revenue) on positives only
+            X_rev_pos = df_train.loc[mask_rev_pos, FEATURE_COLS].values.astype(np.float32)
+            y_rev_log = np.log1p(y_rev[mask_rev_pos])
+            model4b = xgb.XGBRegressor(
+                objective="reg:squarederror", tree_method="hist",
+                n_estimators=400, max_depth=5, learning_rate=0.03,
+                subsample=0.9, colsample_bytree=0.6,
+                random_state=42, verbosity=0,
+            )
+            model4b.fit(X_rev_pos, y_rev_log)
+
+            models["cascade_paso4a"] = model4a
+            models["cascade_paso4b"] = model4b
+            pct_pos = mask_rev_pos.mean() * 100
+            log.info(f"Paso 4 (revenue): Stage A trained ({pct_pos:.1f}% positive), Stage B on {mask_rev_pos.sum():,} positives")
+        else:
+            log.warning("Not enough positive-revenue rows for Paso 4")
+    else:
+        log.warning("revenue_post_12m column not available, skipping Paso 4")
+
     # ── Compute global priority quantiles on training data ──
     if "uplift_model_t" in models and "uplift_model_c" in models:
         X_uplift = df_train[models["uplift_features"]].fillna(0)
@@ -241,7 +395,8 @@ def load_or_train_models(df_train, save=False):
             "k_clusters": best_k,
             "silhouette_score": round(best_sil, 4),
             "n_features_propensity": len(psm_avail),
-            "version": "1.0",
+            "cascade_models": ["paso1_ternary", "paso2_retailer", "paso3_amount", "paso4_revenue"],
+            "version": "2.0",
         }
         with open(MODELS_DIR / "models.pkl", "wb") as f:
             pickle.dump(models, f)
@@ -277,6 +432,18 @@ def score_chunk(df_chunk, models):
     if missing_psm:
         log.warning(f"Missing propensity features (will fill 0): {missing_psm}")
 
+    # ── Encode features for cascade models ──
+    cat_feats = models.get("cat_features", [])
+    bool_feats = models.get("bool_features", [])
+    cascade_feats = models.get("cascade_features", [])
+    if cat_feats and "ordinal_encoder" in models:
+        cat_present = [f for f in cat_feats if f in df_chunk.columns]
+        if cat_present:
+            df_chunk[cat_present] = models["ordinal_encoder"].transform(df_chunk[cat_present])
+        for col in bool_feats:
+            if col in df_chunk.columns:
+                df_chunk[col] = df_chunk[col].astype(int)
+
     # ── Clustering (use training-derived preprocessing params) ──
     X_clust = df_chunk[clust_feats].fillna(0).copy()
     if "days_since_last_activity" in X_clust.columns:
@@ -295,10 +462,62 @@ def score_chunk(df_chunk, models):
     df_chunk["cluster"] = models["kmeans"].predict(X_scaled)
     df_chunk["cluster_name"] = df_chunk["cluster"].map(models["cluster_names"])
 
-    # ── Propensity ──
-    psm_feats = models["psm_features"]
-    X_psm = df_chunk[psm_feats].fillna(0)
-    df_chunk["propensity_score"] = models["propensity_model"].predict_proba(X_psm)[:, 1]
+    # ── Paso 1: Ternary propensity (XGBoost) ──
+    if "cascade_paso1" in models and cascade_feats:
+        X_casc = df_chunk[cascade_feats].values.astype(np.float32)
+        proba = models["cascade_paso1"].predict_proba(X_casc)
+        df_chunk["p_y0"] = proba[:, 0]
+        df_chunk["p_y1"] = proba[:, 1]
+        df_chunk["p_y2"] = proba[:, 2] if proba.shape[1] > 2 else 0
+        df_chunk["propensity_score"] = 1 - proba[:, 0]  # P(canje) = P(y>=1)
+    else:
+        # Fallback: LogReg binary propensity
+        psm_feats_score = models["psm_features"]
+        X_psm = df_chunk[psm_feats_score].fillna(0)
+        df_chunk["propensity_score"] = models["propensity_model"].predict_proba(X_psm)[:, 1]
+        df_chunk["p_y0"] = 1 - df_chunk["propensity_score"]
+        df_chunk["p_y1"] = df_chunk["propensity_score"]
+        df_chunk["p_y2"] = 0
+
+    # ── Paso 2: Retailer prediction ──
+    if "cascade_paso2" in models and cascade_feats:
+        X_casc = df_chunk[cascade_feats].values.astype(np.float32)
+        ret_proba = models["cascade_paso2"].predict_proba(X_casc)
+        ret_pred = models["cascade_paso2"].predict(X_casc)
+        le = models["retailer_encoder"]
+        df_chunk["retailer_recomendado"] = le.inverse_transform(ret_pred)
+        # Top-2 retailers
+        top2 = np.argsort(ret_proba, axis=1)[:, -2:]
+        df_chunk["retailer_top2"] = [
+            f"{le.inverse_transform([t2[1]])[0]},{le.inverse_transform([t2[0]])[0]}"
+            for t2 in top2
+        ]
+        df_chunk["retailer_confidence"] = np.max(ret_proba, axis=1)
+    elif "dominant_retailer" in df_chunk.columns:
+        df_chunk["retailer_recomendado"] = df_chunk["dominant_retailer"]
+        df_chunk.loc[df_chunk["retailer_recomendado"] == "NINGUNO", "retailer_recomendado"] = "STOREA"
+
+    # ── Paso 3: Amount regression (estimated redemption points) ──
+    if "cascade_paso3" in models and cascade_feats:
+        X_casc = df_chunk[cascade_feats].values.astype(np.float32)
+        df_chunk["estimated_points"] = np.maximum(models["cascade_paso3"].predict(X_casc), 0)
+        # Weight by P(canje)
+        df_chunk["expected_points"] = df_chunk["propensity_score"] * df_chunk["estimated_points"]
+    else:
+        df_chunk["estimated_points"] = 0
+        df_chunk["expected_points"] = 0
+
+    # ── Paso 4: Two-stage revenue ──
+    if "cascade_paso4a" in models and "cascade_paso4b" in models and cascade_feats:
+        X_casc = df_chunk[cascade_feats].values.astype(np.float32)
+        p_rev_pos = models["cascade_paso4a"].predict_proba(X_casc)[:, 1]
+        log_rev = models["cascade_paso4b"].predict(X_casc)
+        rev_if_pos = np.expm1(np.maximum(log_rev, 0))
+        df_chunk["estimated_revenue"] = np.maximum(p_rev_pos * rev_if_pos, 0)
+        df_chunk["p_revenue_positive"] = p_rev_pos
+    else:
+        df_chunk["estimated_revenue"] = 0
+        df_chunk["p_revenue_positive"] = 0
 
     # ── Uplift ──
     if "uplift_model_t" in models:
@@ -358,11 +577,6 @@ def score_chunk(df_chunk, models):
         df_chunk.loc[mask_fuga & ~mask_neg, "accion"] = "Reactivacion urgente"
         mask_inscrito = df_chunk["funnel_state_at_t0"] == "INSCRITO"
         df_chunk.loc[mask_inscrito & ~mask_neg, "accion"] = "Activar primera compra"
-
-    # ── Retailer recomendado ──
-    if "dominant_retailer" in df_chunk.columns:
-        df_chunk["retailer_recomendado"] = df_chunk["dominant_retailer"]
-        df_chunk.loc[df_chunk["retailer_recomendado"] == "NINGUNO", "retailer_recomendado"] = "STOREA"
 
     # ── Canal ──
     if "pct_redeem_digital" in df_chunk.columns:
@@ -460,8 +674,12 @@ def run_mock(args):
 
     # Output columns
     OUTPUT_COLS = [
-        "cust_id", "prioridad", "expected_value", "propensity_score", "uplift_x",
-        "objetivo", "accion", "retailer_recomendado", "canal", "timing",
+        "cust_id", "prioridad", "expected_value", "propensity_score",
+        "p_y0", "p_y1", "p_y2",
+        "uplift_x", "retailer_recomendado", "retailer_confidence",
+        "estimated_points", "expected_points",
+        "estimated_revenue", "p_revenue_positive",
+        "objetivo", "accion", "canal", "timing",
         "cluster_name", "funnel_state_at_t0",
     ]
     output_cols = [c for c in OUTPUT_COLS if c in df_scored.columns]
@@ -562,8 +780,12 @@ def run_bigquery(args):
 
     # Write back to BigQuery
     OUTPUT_COLS = [
-        "cust_id", "prioridad", "expected_value", "propensity_score", "uplift_x",
-        "objetivo", "accion", "retailer_recomendado", "canal", "timing",
+        "cust_id", "prioridad", "expected_value", "propensity_score",
+        "p_y0", "p_y1", "p_y2",
+        "uplift_x", "retailer_recomendado", "retailer_confidence",
+        "estimated_points", "expected_points",
+        "estimated_revenue", "p_revenue_positive",
+        "objetivo", "accion", "canal", "timing",
         "cluster_name", "funnel_state_at_t0",
     ]
     output_cols = [c for c in OUTPUT_COLS if c in df_scored.columns]
