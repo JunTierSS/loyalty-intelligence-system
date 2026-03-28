@@ -187,7 +187,7 @@ def load_or_train_models(df_train, save=False):
     ID_COLS = ["cust_id", "t0", "fecha_proceso"]
     TARGET_RELATED = ["has_redeemed_before_t0", "canjea_post", "n_canjes_post",
                       "revenue_post_12m", "retailer_post", "monto_redeem_post",
-                      "spending_post_6m", "txn_count_post_6m"]
+                      "spending_post_6m", "txn_count_post_6m", "treatment"]
     EXCLUDED = set(ID_COLS + ["y"] + TARGET_RELATED + CATEGORICAL_FEATURES + BOOLEAN_FEATURES)
     cat_avail = [f for f in CATEGORICAL_FEATURES if f in df_train.columns]
     bool_avail = [f for f in BOOLEAN_FEATURES if f in df_train.columns]
