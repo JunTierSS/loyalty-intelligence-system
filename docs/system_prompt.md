@@ -156,7 +156,7 @@ y = 2: Canjea Y ya habia canjeado (recurrencia)
 
 **Grupo D (Capacidad, 4):** redeem_capacity (BOOL >=1000pts), points_above_threshold, days_to_redeem_capacity, points_pressure (=exp_current/stock)
 
-**Grupo E (Retailer, 11):** spend_store_a/sodimac/tottus/fcom/ikea (5), freq_store_a/sodimac/tottus/fcom/ikea (5), retailer_count, dominant_retailer, retailer_entropy (Shannon frequency-based)
+**Grupo E (Retailer, 11):** spend_store_a/store_b/store_c/store_d/store_e (5), freq_store_a/store_b/store_c/store_d/store_e (5), retailer_count, dominant_retailer, retailer_entropy (Shannon frequency-based)
 
 **Grupo F (Pago, 4):** pct_store_card_payments, pct_debit_payments, purchase_channel_pref, pct_digital
 

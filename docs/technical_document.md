@@ -293,8 +293,8 @@ ENE 2022          ENE 2023                              MAR 2025          MAR 20
 
 | Feature | Formula | Supuesto |
 |---|---|---|
-| spend_store_a/sodimac/tottus/fcom/ikea | SUM(tran_amt) por retailer | 5 features de gasto |
-| freq_store_a/sodimac/tottus/fcom/ikea | COUNT(txns) por retailer | 5 features de frecuencia |
+| spend_store_a/store_b/store_c/store_d/store_e | SUM(tran_amt) por retailer | 5 features de gasto |
+| freq_store_a/store_b/store_c/store_d/store_e | COUNT(txns) por retailer | 5 features de frecuencia |
 | retailer_count | COUNT(DISTINCT retailer) | Diversificacion |
 | dominant_retailer | Retailer con mayor gasto | Para recomendacion de oferta |
 | retailer_entropy | Shannon entropy sobre frecuencias | H = -SUM(p * log(p)), frecuency-based |

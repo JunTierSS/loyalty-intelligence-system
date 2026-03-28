@@ -1,10 +1,10 @@
 -- =============================================================================
 -- FASE 1: FUNNEL MARKOV — 6 ESTADOS + MATRIZ DE TRANSICIÓN MENSUAL
 -- Proyecto: my-gcp-project
--- Dataset destino: loyalty_analytics
+-- Dataset destino: loyalty_intelligence
 -- Tablas destino:
---   loyalty_analytics.funnel_states_monthly  (estado mensual por cliente)
---   loyalty_analytics.markov_transition_matrix (probabilidades de transición)
+--   loyalty_intelligence.funnel_states_monthly  (estado mensual por cliente)
+--   loyalty_intelligence.markov_transition_matrix (probabilidades de transición)
 -- Descripción:
 --   6 estados del funnel de canje:
 --     1. INSCRITO          — Sin transacciones históricas
@@ -22,9 +22,18 @@
 -- PASO 1: ESTADO MENSUAL POR CLIENTE
 -- Captura el estado de cada cliente en el último día de cada mes
 -- Rango: Enero 2022 - Marzo 2026 (para cubrir pre y post de los 27 snapshots)
+--
+-- ⚠ DATA LEAKAGE NOTE: This table is pre-computed over the ENTIRE date range
+-- (2022-01 to 2026-03), including months that fall after t0 for some snapshots.
+-- The downstream 04_customer_snapshot.sql JOIN filters funnel states to
+-- fecha_fin_mes < t0, which prevents direct leakage. However, the cumulative
+-- counters used to determine funnel states (e.g., n_canjes_historicos) are
+-- computed using the full transaction history up to each month, not just up to
+-- t0. This is a structural limitation inherent in pre-computing a monthly table.
+-- In production, this should be recomputed per t0 or use a temporal CTE.
 -- ===========================================================================
 
-CREATE OR REPLACE TABLE `my-gcp-project.loyalty_analytics.funnel_states_monthly` AS
+CREATE OR REPLACE TABLE `my-gcp-project.loyalty_intelligence.funnel_states_monthly` AS
 
 WITH
 
@@ -45,7 +54,7 @@ meses AS (
 -- -----------------------------------------------------------------------
 muestra AS (
   SELECT cust_id, enrollment_date
-  FROM `my-gcp-project.loyalty_analytics.sample_customers`
+  FROM `my-gcp-project.loyalty_intelligence.sample_customers`
 ),
 
 -- -----------------------------------------------------------------------
@@ -202,7 +211,7 @@ FROM estado_calculado;
 -- Calcula P(estado_siguiente | estado_actual, tier_group, retailer_dominante)
 -- ===========================================================================
 
-CREATE OR REPLACE TABLE `my-gcp-project.loyalty_analytics.markov_transition_matrix` AS
+CREATE OR REPLACE TABLE `my-gcp-project.loyalty_intelligence.markov_transition_matrix` AS
 
 WITH
 
@@ -222,8 +231,8 @@ transiciones AS (
       WHEN UPPER(curr.tier) IN ('ELITE', 'PREMIUM') THEN 'ALTO'
       ELSE 'BASE'
     END                                    AS tier_group
-  FROM `my-gcp-project.loyalty_analytics.funnel_states_monthly` curr
-  INNER JOIN `my-gcp-project.loyalty_analytics.funnel_states_monthly` next_m
+  FROM `my-gcp-project.loyalty_intelligence.funnel_states_monthly` curr
+  INNER JOIN `my-gcp-project.loyalty_intelligence.funnel_states_monthly` next_m
     ON  curr.cust_id      = next_m.cust_id
     AND DATE_ADD(curr.fecha_fin_mes, INTERVAL 1 MONTH) = next_m.fecha_fin_mes
   -- Solo periodo de entrenamiento (hasta último snapshot del train set)
@@ -295,13 +304,13 @@ SELECT
   funnel_state,
   COUNT(*) AS n_clientes,
   ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (PARTITION BY mes_inicio), 2) AS pct
-FROM `my-gcp-project.loyalty_analytics.funnel_states_monthly`
+FROM `my-gcp-project.loyalty_intelligence.funnel_states_monthly`
 GROUP BY 1, 2
 ORDER BY 1, 2;
 
 -- Matriz de transición completa
 SELECT *
-FROM `my-gcp-project.loyalty_analytics.markov_transition_matrix`
+FROM `my-gcp-project.loyalty_intelligence.markov_transition_matrix`
 ORDER BY tier_group, estado_origen, prob_transicion DESC;
 
 -- Verificar que probabilidades suman 1 por estado origen
@@ -309,6 +318,6 @@ SELECT
   tier_group,
   estado_origen,
   SUM(prob_transicion) AS suma_prob
-FROM `my-gcp-project.loyalty_analytics.markov_transition_matrix`
+FROM `my-gcp-project.loyalty_intelligence.markov_transition_matrix`
 GROUP BY 1, 2;
 */

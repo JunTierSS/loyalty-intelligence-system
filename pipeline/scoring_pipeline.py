@@ -38,7 +38,7 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 # ── Config ──────────────────────────────────────────────────────────────────
 CHUNK_SIZE = 1_000_000  # 1M clientes por chunk
-DATASET = "loyalty_analytics"
+DATASET = "loyalty_intelligence"
 SCORING_TABLE = "scoring_output"
 PROJECT = "my-gcp-project"
 
@@ -68,6 +68,14 @@ def load_or_train_models(df_train, save=False):
 
     models = {}
 
+    # ── Drop post-t0 columns to prevent accidental leakage ──
+    POST_T0_COLS = ["revenue_post_12m", "spending_post_6m", "txn_count_post_6m",
+                    "canjea_post", "n_canjes_post"]
+    leaked = [c for c in POST_T0_COLS if c in df_train.columns]
+    if leaked:
+        log.info(f"Dropping post-t0 columns from training data: {leaked}")
+        df_train = df_train.drop(columns=leaked)
+
     # ── Clustering ──
     CLUSTER_FEATURES = [
         "frequency_monthly_avg", "monetary_monthly_avg", "redeem_rate",
@@ -81,14 +89,18 @@ def load_or_train_models(df_train, save=False):
     if "days_since_last_activity" in X_clust.columns:
         X_clust["days_since_last_activity"] = X_clust["days_since_last_activity"].fillna(999)
 
-    # Log transform skewed features
+    # Log transform skewed features (store flags for scoring)
+    skew_flags = {}
     for col in X_clust.columns:
-        if X_clust[col].skew() > 2:
+        skew_flags[col] = bool(X_clust[col].skew() > 2)
+        if skew_flags[col]:
             X_clust[col] = np.log1p(X_clust[col])
 
-    # Winsorize
+    # Winsorize (store bounds for scoring)
+    quantile_bounds = {}
     for col in X_clust.columns:
         p1, p99 = X_clust[col].quantile([0.01, 0.99])
+        quantile_bounds[col] = (float(p1), float(p99))
         X_clust[col] = X_clust[col].clip(p1, p99)
 
     scaler = StandardScaler()
@@ -119,11 +131,11 @@ def load_or_train_models(df_train, save=False):
 
     ARCHETYPES = {
         "Heavy Users": {"frequency_monthly_avg": 1, "monetary_monthly_avg": 1, "earn_velocity_90": 1},
-        "Cazadores de Canje": {"redeem_rate": 1, "pct_redeem_digital": 1, "points_pressure": 1},
+        "Cazadores de Canje": {"redeem_rate": 2.5, "pct_redeem_digital": 1, "points_pressure": 1},
         "Dormidos": {"days_since_last_activity": 1},
         "Exploradores": {"retailer_entropy": 1},
         "Digitales": {"pct_redeem_digital": 1},
-        "En Riesgo": {"days_since_last_activity": 0.7, "points_pressure": 0.5},
+        "En Riesgo": {"days_since_last_activity": 1.5, "points_pressure": 1.5, "redeem_rate": 0.5},
     }
 
     from scipy.optimize import linear_sum_assignment
@@ -142,13 +154,15 @@ def load_or_train_models(df_train, save=False):
     models["cluster_scaler"] = scaler
     models["cluster_features"] = available
     models["cluster_names"] = cluster_names
+    models["cluster_skew_flags"] = skew_flags
+    models["cluster_quantile_bounds"] = quantile_bounds
     models["K"] = best_k
 
     log.info(f"Clustering: K={best_k}, silhouette={best_sil:.4f}")
     for k, v in cluster_names.items():
         log.info(f"  Cluster {k} = {v}")
 
-    # ── Propensity (Logistic Regression for scoring — simpler than XGBoost for pipeline) ──
+    # ── Propensity (cross-fitted to avoid using target directly) ──
     PSM_FEATURES = [
         "frequency_monthly_avg", "monetary_monthly_avg", "redeem_rate",
         "retailer_entropy", "pct_redeem_digital", "earn_velocity_90",
@@ -156,25 +170,38 @@ def load_or_train_models(df_train, save=False):
         "redeem_count_pre", "frequency_total", "monetary_total", "tenure_months",
     ]
     psm_avail = [f for f in PSM_FEATURES if f in df_train.columns]
-    treatment = (df_train["y"] > 0).astype(int) if "y" in df_train.columns else pd.Series(0, index=df_train.index)
+    treatment = (df_train["y"] >= 1).astype(int) if "y" in df_train.columns else pd.Series(0, index=df_train.index)
 
+    # Cross-fitted propensity: train on odd-indexed rows, predict on even, and vice versa
+    from sklearn.model_selection import StratifiedKFold
     X_psm = df_train[psm_avail].fillna(0)
+    prop_scores = np.zeros(len(df_train))
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    for train_idx, val_idx in skf.split(X_psm, treatment):
+        fold_model = LogisticRegression(max_iter=1000, random_state=42)
+        fold_model.fit(X_psm.iloc[train_idx], treatment.iloc[train_idx])
+        prop_scores[val_idx] = fold_model.predict_proba(X_psm.iloc[val_idx])[:, 1]
+
+    # Final model on all data for scoring new customers
     prop_model = LogisticRegression(max_iter=1000, random_state=42)
     prop_model.fit(X_psm, treatment)
     models["propensity_model"] = prop_model
     models["psm_features"] = psm_avail
-    log.info(f"Propensity model trained on {len(psm_avail)} features")
+    log.info(f"Propensity model trained (cross-fitted) on {len(psm_avail)} features")
 
     # ── Uplift (T-Learner with XGBoost) ──
+    # NOTE: Uses monetary_total (pre-t0) as outcome proxy to avoid post-t0 leakage.
+    # spending_post_6m is available in notebooks for causal analysis but NOT used here
+    # because it introduces temporal contamination (treatment and outcome in same window).
     treated_mask = treatment == 1
     if treated_mask.sum() > 50 and (~treated_mask).sum() > 50:
         uplift_features = psm_avail
         X_t = df_train.loc[treated_mask, uplift_features].fillna(0)
         X_c = df_train.loc[~treated_mask, uplift_features].fillna(0)
 
-        y_col = "monetary_total"  # Use as outcome proxy
-        if "spending_post_6m" in df_train.columns:
-            y_col = "spending_post_6m"
+        # Use monetary_total as outcome (pre-t0 proxy, avoids post-t0 leakage)
+        y_col = "monetary_total"
+        log.info(f"Uplift outcome: {y_col}")
 
         y_t = df_train.loc[treated_mask, y_col].fillna(0)
         y_c = df_train.loc[~treated_mask, y_col].fillna(0)
@@ -230,7 +257,14 @@ def load_or_train_models(df_train, save=False):
 # PASO 2: SCORING DE UN CHUNK
 # ══════════════════════════════════════════════════════════════════════════
 def score_chunk(df_chunk, models):
-    """Apply all models to a chunk of customers."""
+    """Apply all models to a chunk of customers. Only transforms/predicts, never fits."""
+
+    # ── Drop post-t0 columns if present (prevent leakage) ──
+    POST_T0_COLS = ["revenue_post_12m", "spending_post_6m", "txn_count_post_6m",
+                    "canjea_post", "n_canjes_post"]
+    leaked = [c for c in POST_T0_COLS if c in df_chunk.columns]
+    if leaked:
+        df_chunk = df_chunk.drop(columns=leaked)
 
     # ── Feature validation ──
     clust_feats = models["cluster_features"]
@@ -243,16 +277,19 @@ def score_chunk(df_chunk, models):
     if missing_psm:
         log.warning(f"Missing propensity features (will fill 0): {missing_psm}")
 
-    # ── Clustering ──
+    # ── Clustering (use training-derived preprocessing params) ──
     X_clust = df_chunk[clust_feats].fillna(0).copy()
     if "days_since_last_activity" in X_clust.columns:
         X_clust["days_since_last_activity"] = X_clust["days_since_last_activity"].fillna(999)
+    skew_flags = models.get("cluster_skew_flags", {})
     for col in X_clust.columns:
-        if X_clust[col].skew() > 2:
+        if skew_flags.get(col, False):
             X_clust[col] = np.log1p(X_clust[col])
+    quantile_bounds = models.get("cluster_quantile_bounds", {})
     for col in X_clust.columns:
-        p1, p99 = X_clust[col].quantile([0.01, 0.99])
-        X_clust[col] = X_clust[col].clip(p1, p99)
+        if col in quantile_bounds:
+            p1, p99 = quantile_bounds[col]
+            X_clust[col] = X_clust[col].clip(p1, p99)
 
     X_scaled = models["cluster_scaler"].transform(X_clust)
     df_chunk["cluster"] = models["kmeans"].predict(X_scaled)
@@ -283,17 +320,11 @@ def score_chunk(df_chunk, models):
 
     q60 = models.get("priority_q60")
     q80 = models.get("priority_q80")
-    if q60 is not None and q80 is not None:
-        df_chunk.loc[(~mask_neg) & (df_chunk["uplift_x"] >= q80), "prioridad"] = "Alta"
-        df_chunk.loc[(~mask_neg) & (df_chunk["uplift_x"] >= q60) & (df_chunk["uplift_x"] < q80), "prioridad"] = "Media"
-    else:
-        # Fallback: per-chunk quantiles (only if global not available)
-        pos = df_chunk[~mask_neg]
-        if len(pos) > 0:
-            q60_local = pos["uplift_x"].quantile(0.60)
-            q80_local = pos["uplift_x"].quantile(0.80)
-            df_chunk.loc[(~mask_neg) & (df_chunk["uplift_x"] >= q80_local), "prioridad"] = "Alta"
-            df_chunk.loc[(~mask_neg) & (df_chunk["uplift_x"] >= q60_local) & (df_chunk["uplift_x"] < q80_local), "prioridad"] = "Media"
+    if q60 is None or q80 is None:
+        raise ValueError("Global priority quantiles (Q60/Q80) missing from models. Retrain with --save-models.")
+    # Boundary: > Q60 (exclusive), <= Q80 (inclusive) — consistent with decision engine
+    df_chunk.loc[(~mask_neg) & (df_chunk["uplift_x"] > q80), "prioridad"] = "Alta"
+    df_chunk.loc[(~mask_neg) & (df_chunk["uplift_x"] > q60) & (df_chunk["uplift_x"] <= q80), "prioridad"] = "Media"
 
     # ── Objetivo (from funnel) ──
     OBJETIVO_FUNNEL = {
@@ -314,7 +345,7 @@ def score_chunk(df_chunk, models):
         "Heavy Users": "Experiencia premium exclusiva",
         "Dormidos": "Oferta directa de reactivacion",
         "Digitales": "Oferta exclusiva canal digital",
-        "En Riesgo": "Retencion preventiva",
+        "En Riesgo": "Retencion preventiva con puntos bonus",
     }
     df_chunk["accion"] = df_chunk["cluster_name"].map(ACCION_CLUSTER).fillna("Contacto general")
 
@@ -364,7 +395,7 @@ def run_mock(args):
     """Run pipeline on mock data."""
     log.info("=== SCORING PIPELINE (MOCK) ===")
 
-    # Load mock data via fase2e
+    # Load mock data via decision engine notebook
     import nbformat
     nb_path = BASE_DIR / "notebooks" / "05_decision_engine.ipynb"
     nb = nbformat.read(str(nb_path), as_version=4)

@@ -1,21 +1,21 @@
 -- =============================================================================
 -- FASE 1: CUSTOMER SNAPSHOT — QUERY MONOLÍTICA CON CTEs
 -- Proyecto: my-gcp-project
--- Dataset destino: loyalty_analytics
--- Tabla destino: loyalty_analytics.customer_snapshot
+-- Dataset destino: loyalty_intelligence
+-- Tabla destino: loyalty_intelligence.customer_snapshot
 -- Descripción:
 --   Genera 27 snapshots de entrenamiento (ENE 2023 → MAR 2025) × 500K clientes
 --   = ~13.5M filas. Para cada snapshot t0 calcula:
 --     - ~70 features de los 12 meses pre-t0 (grupos A-K)
 --     - Variable target y ∈ {0, 1, 2} de los 12 meses post-t0
 --   Pre-requisitos:
---     - loyalty_analytics.sample_customers
---     - loyalty_analytics.funnel_states_monthly
---     - loyalty_analytics.markov_transition_matrix
+--     - loyalty_intelligence.sample_customers
+--     - loyalty_intelligence.funnel_states_monthly
+--     - loyalty_intelligence.markov_transition_matrix
 --     - frozen_transaction_entity, frozen_redemption_entity, svw_clients_entity
 -- =============================================================================
 
-CREATE OR REPLACE TABLE `my-gcp-project.loyalty_analytics.customer_snapshot`
+CREATE OR REPLACE TABLE `my-gcp-project.loyalty_intelligence.customer_snapshot`
 PARTITION BY DATE_TRUNC(t0, MONTH)
 CLUSTER BY tier, funnel_state_at_t0, y
 AS
@@ -38,7 +38,7 @@ t0_list AS (
 -- ===========================================================================
 muestra AS (
   SELECT cust_id, tier AS tier_actual, enrollment_date, has_redeemed AS has_redeemed_global
-  FROM `my-gcp-project.loyalty_analytics.sample_customers`
+  FROM `my-gcp-project.loyalty_intelligence.sample_customers`
 ),
 
 -- ===========================================================================
@@ -70,7 +70,7 @@ demograficas AS (
     MAX_BY(c.contact_email_flg,     c.partition_date)   AS contact_email_flg,
     MAX_BY(c.contact_phone_flg,     c.partition_date)   AS contact_phone_flg,
     MAX_BY(c.contact_push_flg,      c.partition_date)   AS contact_push_flg,
-    MAX_BY(c.cust_active_card_flg,   c.partition_date)   AS cust_active_card_flg,
+    MAX_BY(c.cust_active_store_card_flg,   c.partition_date)   AS cust_active_store_card_flg,
     MAX_BY(c.cust_active_deb_flg,   c.partition_date)   AS cust_active_deb_flg,
     MAX_BY(c.cust_active_omp_flg,   c.partition_date)   AS cust_active_omp_flg,
     -- Saldo de puntos recalculado históricamente en t0
@@ -240,9 +240,13 @@ funnel_with_lag AS (
     LAG(fs.funnel_state) OVER (
       PARTITION BY fs.cust_id ORDER BY fs.fecha_fin_mes
     ) AS prev_funnel_state
-  FROM `my-gcp-project.loyalty_analytics.funnel_states_monthly` fs
+  FROM `my-gcp-project.loyalty_intelligence.funnel_states_monthly` fs
 ),
 
+-- NOTE: funnel_states_monthly is pre-computed over the full date range.
+-- The JOIN condition (fecha_fin_mes < t0) ensures only pre-t0 states are used,
+-- but the underlying funnel state computation sees all historical transactions.
+-- See 03_markov_transition_matrix.sql for details on this structural limitation.
 funnel_pre AS (
   SELECT
     b.cust_id,
@@ -288,7 +292,7 @@ markov_probs AS (
   FROM funnel_pre fp
   LEFT JOIN demograficas d_tier
     ON  d_tier.cust_id = fp.cust_id AND d_tier.t0 = fp.t0
-  LEFT JOIN `my-gcp-project.loyalty_analytics.markov_transition_matrix` mt
+  LEFT JOIN `my-gcp-project.loyalty_intelligence.markov_transition_matrix` mt
     ON  mt.estado_origen  = fp.funnel_state_at_t0
     AND mt.tier_group     = CASE
                               WHEN UPPER(d_tier.tier) IN ('ELITE', 'PREMIUM') THEN 'ALTO'
@@ -385,7 +389,7 @@ snapshot_final AS (
     d.gender,
     d.age,
     d.city,
-    d.cust_active_card_flg,
+    d.cust_active_store_card_flg,
     d.cust_active_deb_flg,
     d.cust_active_omp_flg,
     COALESCE(d.contact_email_flg, FALSE)   AS contact_email_flg,
@@ -582,7 +586,10 @@ snapshot_final AS (
 
     -- -----------------------------------------------------------------------
     -- TARGET VARIABLE
-    -- -----------------------------------------------------------------------
+    -- ── Target / post-t0 variables (for analysis only, NOT features) ──────
+    -- WARNING: These columns contain post-t0 data. They must NEVER be used
+    -- as input features for any model. They are included for target definition
+    -- and offline analysis only. The scoring pipeline drops them automatically.
     tgt.has_redeemed_before_t0,
     tgt.canjea_post,
     tgt.n_canjes_post,
@@ -629,25 +636,25 @@ SELECT
   y,
   COUNT(*) AS n,
   ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (PARTITION BY t0), 2) AS pct
-FROM `my-gcp-project.loyalty_analytics.customer_snapshot`
+FROM `my-gcp-project.loyalty_intelligence.customer_snapshot`
 GROUP BY t0, y
 ORDER BY t0, y;
 
 -- Total filas
 SELECT COUNT(*) AS total_filas, COUNT(DISTINCT cust_id) AS clientes_distintos,
        COUNT(DISTINCT t0) AS n_snapshots
-FROM `my-gcp-project.loyalty_analytics.customer_snapshot`;
+FROM `my-gcp-project.loyalty_intelligence.customer_snapshot`;
 
 -- Distribución por funnel state en t0
 SELECT
   funnel_state_at_t0,
   COUNT(*) AS n,
   AVG(CASE WHEN y > 0 THEN 1.0 ELSE 0 END) AS tasa_canje
-FROM `my-gcp-project.loyalty_analytics.customer_snapshot`
+FROM `my-gcp-project.loyalty_intelligence.customer_snapshot`
 GROUP BY 1
 ORDER BY n DESC;
 
 -- Verificar no-leakage: target debe estar vacío para t0 > 2025-03
-SELECT t0, COUNT(*) FROM `my-gcp-project.loyalty_analytics.customer_snapshot`
+SELECT t0, COUNT(*) FROM `my-gcp-project.loyalty_intelligence.customer_snapshot`
 WHERE t0 > '2025-03-01' GROUP BY 1;
 */
