@@ -113,28 +113,54 @@ Optuna Bayesian optimization tunes each model's hyperparameters (max_depth, lear
 
 ---
 
-## 3. Causal Incrementality
+## 3. Incrementality
 
-Propensity alone tells you who is *likely* to redeem, not who would redeem *because of* an intervention. The incrementality module estimates causal uplift to distinguish inherent behavior from treatment effect.
+The system measures incrementality at two levels: (1) aggregate lift by spending quintile (production methodology), and (2) individual uplift via causal ML models. Both approaches answer the same question: does redemption drive additional spend, or do high-spenders simply redeem more?
 
-### 3.1 Why PSM, Not RCT
+### 3.1 Production Methodology (Lift by Spending Quintile)
 
-The system operates on observational data -- past campaign exposure is not randomly assigned. Propensity Score Matching (PSM) is the standard approach for causal inference from observational data when treatment assignment can be approximated by observable covariates.
+The baseline approach, inherited from the existing production system:
 
-### 3.2 Propensity Score Matching
+1. **Classify customers:**
+   - **Redeemer**: redeemed in the post-t0 window (y >= 1)
+   - **Potential redeemer**: >= 1,000 points, did NOT redeem
+   - **Non-potential**: < 1,000 points (excluded from analysis)
+
+2. **Filters:**
+   - Survivorship: exclude customers with pre-spend = 0 or post-spend = 0
+   - Outliers: exclude top 1% in both pre and post spend
+
+3. **Stratify by pre-t0 spending quintiles** (NTILE(5) over monetary_total, partitioned by t0). This ensures redeemers are compared against non-redeemers with **similar historical spending levels**.
+
+4. **Lift per quintile:**
+   ```
+   Lift(Q) = (avg_post_spend_redeemer(Q) - avg_post_spend_potential(Q)) / avg_post_spend_potential(Q)
+   ```
+
+5. **Global lift**: weighted average across quintiles, weighted by redeemer spend.
+
+This approach is transparent and directly comparable across periods. Its limitation is that it only controls for one variable (spending level) and cannot isolate individual treatment effects.
+
+### 3.2 PSM Enhancement (Within-Quintile Matching)
+
+Propensity Score Matching improves on the production method by matching on multiple covariates **within each spending quintile**:
 
 - **Covariates:** 13 pre-treatment features (frequency, monetary, redeem rate, retailer entropy, digital affinity, earn velocity, inactivity, points pressure, stock points, redeem count, tenure)
-- **Caliper:** 0.05 standard deviations of the logit propensity
+- **Matching:** Nearest neighbor within each quintile, caliper = 0.05 SD of logit propensity
 - **Balance check:** Standardized Mean Difference (SMD) < 0.1 for all covariates post-matching
-- **Common support:** Trimmed to the overlap region of propensity distributions
+- **Same filters** as production (survivorship, outlier removal) for fair comparison
 
-### 3.3 T-Learner (CATE Estimation)
+Matching within quintiles ensures that the propensity-matched control has similar spending level AND similar observable characteristics. This corrects the bias from the production method where redeemers and potentials within the same quintile may differ on other dimensions.
 
-Two separate GradientBoostingRegressor models:
+### 3.3 T-Learner (Individual CATE)
+
+Two separate GradientBoostingRegressor models estimate individual treatment effects:
 - **mu1**: E[Y | X, T=1] -- expected outcome for treated
 - **mu0**: E[Y | X, T=0] -- expected outcome for control
 
 CATE(x) = mu1(x) - mu0(x), the individual treatment effect.
+
+Both models are 2-fold cross-fitted: each customer's counterfactual prediction comes from a model that never saw their outcome during training.
 
 ### 3.4 X-Learner (Refinement)
 
@@ -148,11 +174,26 @@ The X-Learner improves CATE estimates when treatment and control groups have dif
 
 ### 3.5 Outcome Variable
 
-The outcome is **monetary_total** (pre-t0 total spend), not spending_post_6m. Using a post-t0 outcome as the uplift target would create temporal contamination: the treatment (campaign) and outcome (post-period spend) would overlap, inflating apparent uplift by ~70x.
+For the production lift method, the outcome is **spending_post_6m** (post-t0 spend), which is the natural business metric.
+
+For the uplift models (T-Learner, X-Learner) used in scoring, the outcome is **monetary_total** (pre-t0 total spend). Using a post-t0 outcome as the uplift target in the scoring pipeline would create temporal contamination: the treatment and outcome would overlap in the same window, inflating apparent uplift by ~70x.
 
 ### 3.6 ATT Estimation
 
-Average Treatment Effect on the Treated (ATT) is estimated with bootstrap 95% confidence intervals (1000 iterations). This quantifies the aggregate impact of campaigns on the treated population.
+Average Treatment Effect on the Treated (ATT) is estimated per quintile and globally, with:
+- Bootstrap 95% confidence intervals (1000 iterations)
+- Permutation test as primary significance test (distribution-free)
+- Paired t-test and Wilcoxon as sensitivity checks
+
+### 3.7 Three Levels of Incrementality
+
+| Method | Level | Controls for | Quintiles by |
+|--------|-------|-------------|--------------|
+| Production (GitLab) | Per quintile | Pre-t0 spending level | Spending pre |
+| PSM (within quintile) | Per quintile | Spending + 13 covariates | Spending pre |
+| Uplift model (X-Learner) | Individual | All observable features | CATE estimate |
+
+The production method provides the business-facing lift metric. PSM validates whether the lift holds after controlling for confounders. The uplift model enables individual-level targeting for the decision engine.
 
 ---
 
