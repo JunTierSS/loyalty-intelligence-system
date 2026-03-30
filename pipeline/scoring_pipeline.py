@@ -48,6 +48,10 @@ DATASET = "loyalty_intelligence"
 SCORING_TABLE = "scoring_output"
 PROJECT = "my-gcp-project"
 
+# Post-t0 columns dropped to prevent temporal leakage (used by both train and score)
+POST_T0_COLS = ["revenue_post_12m", "spending_post_6m", "txn_count_post_6m",
+                "canjea_post", "n_canjes_post", "retailer_post", "monto_redeem_post"]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Scoring Pipeline Mensual")
@@ -83,8 +87,6 @@ def load_or_train_models(df_train, save=False):
             cascade_targets[col] = df_train[col].copy()
 
     # ── Drop post-t0 columns to prevent accidental leakage ──
-    POST_T0_COLS = ["revenue_post_12m", "spending_post_6m", "txn_count_post_6m",
-                    "canjea_post", "n_canjes_post", "retailer_post", "monto_redeem_post"]
     leaked = [c for c in POST_T0_COLS if c in df_train.columns]
     if leaked:
         log.info(f"Dropping post-t0 columns from training data: {leaked}")
@@ -195,7 +197,7 @@ def load_or_train_models(df_train, save=False):
     FEATURE_COLS = cat_avail + bool_avail + num_avail
 
     # Ordinal encode categoricals (fit on train only)
-    ord_enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+    ord_enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan)
     df_train[cat_avail] = ord_enc.fit_transform(df_train[cat_avail])
     for col in bool_avail:
         df_train[col] = df_train[col].astype(int)
@@ -312,7 +314,7 @@ def load_or_train_models(df_train, save=False):
         else:
             log.warning("Not enough canjeadores for Paso 2 retailer model")
     else:
-        log.warning("retailer_post column not available, skipping Paso 2")
+        log.warning("retailer_post column not in data — requires transaction-level aggregation (02_cascade.ipynb). Expected in production BigQuery, not in mock.")
 
     # ── Paso 3: Amount regression (canjeadores with monto > 0) ──
     if "monto_redeem_post" in cascade_targets:
@@ -334,13 +336,15 @@ def load_or_train_models(df_train, save=False):
         else:
             log.warning("Not enough data for Paso 3 amount model")
     else:
-        log.warning("monto_redeem_post column not available, skipping Paso 3")
+        log.warning("monto_redeem_post column not in data — requires transaction-level aggregation (02_cascade.ipynb). Expected in production BigQuery, not in mock.")
 
     # ── Paso 4: Two-stage revenue (Stage A: binary, Stage B: log-regression) ──
     if "revenue_post_12m" in cascade_targets:
         y_rev = cascade_targets["revenue_post_12m"].fillna(0).values
         y_rev_bin = (y_rev > 0).astype(int)
         mask_rev_pos = y_rev > 0
+        pct_pos = mask_rev_pos.mean() * 100
+        log.info(f"Paso 4 revenue distribution: {pct_pos:.1f}% positive, mean={y_rev[mask_rev_pos].mean():,.0f}" if mask_rev_pos.any() else "Paso 4: no positive revenue rows")
 
         if mask_rev_pos.sum() > 20:
             # Stage A: P(revenue > 0)
@@ -350,9 +354,12 @@ def load_or_train_models(df_train, save=False):
                 objective="binary:logistic", tree_method="hist", eval_metric="auc",
                 n_estimators=400, max_depth=5, learning_rate=0.03,
                 subsample=0.9, colsample_bytree=0.6, scale_pos_weight=min(spw, 5.0),
-                random_state=42, verbosity=0,
+                early_stopping_rounds=50, random_state=42, verbosity=0,
             )
-            model4a.fit(X_rev, y_rev_bin)
+            # Use 20% of data as eval set for early stopping
+            n_eval = max(int(len(X_rev) * 0.2), 1)
+            model4a.fit(X_rev[:-n_eval], y_rev_bin[:-n_eval],
+                        eval_set=[(X_rev[-n_eval:], y_rev_bin[-n_eval:])], verbose=False)
 
             # Stage B: log1p(revenue) on positives only
             X_rev_pos = df_train.loc[mask_rev_pos, FEATURE_COLS].values.astype(np.float32)
@@ -361,13 +368,14 @@ def load_or_train_models(df_train, save=False):
                 objective="reg:squarederror", tree_method="hist",
                 n_estimators=400, max_depth=5, learning_rate=0.03,
                 subsample=0.9, colsample_bytree=0.6,
-                random_state=42, verbosity=0,
+                early_stopping_rounds=50, random_state=42, verbosity=0,
             )
-            model4b.fit(X_rev_pos, y_rev_log)
+            n_eval_b = max(int(len(X_rev_pos) * 0.2), 1)
+            model4b.fit(X_rev_pos[:-n_eval_b], y_rev_log[:-n_eval_b],
+                        eval_set=[(X_rev_pos[-n_eval_b:], y_rev_log[-n_eval_b:])], verbose=False)
 
             models["cascade_paso4a"] = model4a
             models["cascade_paso4b"] = model4b
-            pct_pos = mask_rev_pos.mean() * 100
             log.info(f"Paso 4 (revenue): Stage A trained ({pct_pos:.1f}% positive), Stage B on {mask_rev_pos.sum():,} positives")
         else:
             log.warning("Not enough positive-revenue rows for Paso 4")
@@ -396,6 +404,8 @@ def load_or_train_models(df_train, save=False):
             "silhouette_score": round(best_sil, 4),
             "n_features_propensity": len(psm_avail),
             "cascade_models": ["paso1_ternary", "paso2_retailer", "paso3_amount", "paso4_revenue"],
+            "cascade_features": FEATURE_COLS,
+            "n_cascade_features": len(FEATURE_COLS),
             "version": "2.0",
         }
         with open(MODELS_DIR / "models.pkl", "wb") as f:
@@ -415,8 +425,6 @@ def score_chunk(df_chunk, models):
     """Apply all models to a chunk of customers. Only transforms/predicts, never fits."""
 
     # ── Drop post-t0 columns if present (prevent leakage) ──
-    POST_T0_COLS = ["revenue_post_12m", "spending_post_6m", "txn_count_post_6m",
-                    "canjea_post", "n_canjes_post"]
     leaked = [c for c in POST_T0_COLS if c in df_chunk.columns]
     if leaked:
         df_chunk = df_chunk.drop(columns=leaked)
@@ -436,6 +444,14 @@ def score_chunk(df_chunk, models):
     cat_feats = models.get("cat_features", [])
     bool_feats = models.get("bool_features", [])
     cascade_feats = models.get("cascade_features", [])
+
+    # Validate cascade features exist in scoring data
+    missing_cascade = [f for f in cascade_feats if f not in df_chunk.columns]
+    if missing_cascade:
+        log.warning(f"Missing {len(missing_cascade)} cascade features in scoring data (filling with 0): {missing_cascade[:10]}")
+        for f in missing_cascade:
+            df_chunk[f] = 0
+
     if cat_feats and "ordinal_encoder" in models:
         cat_present = [f for f in cat_feats if f in df_chunk.columns]
         if cat_present:

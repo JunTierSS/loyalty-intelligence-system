@@ -112,7 +112,7 @@ Y traducir las respuestas en **acciones concretas**: que oferta, por que canal, 
 
 | Tabla | Descripcion | Campos clave |
 |---|---|---|
-| `svw_clients_entity` | Clientes con tier, puntos, flags | cust_id, tier, stock_points_amt, cust_active_card_flg |
+| `svw_clients_entity` | Clientes con tier, puntos, flags | cust_id, tier, stock_points_amt, cust_active_store_card_flg |
 | `frozen_transaction_entity` | Transacciones historicas | cust_id, tran_date, tran_amt, retailer, points_earned |
 | `frozen_redemption_entity` | Canjes historicos | cust_id, redemption_date, points_redeemed, channel |
 
@@ -346,7 +346,7 @@ ENE 2022          ENE 2023                              MAR 2025          MAR 20
 | gender | Genero | De cust_gender_desc |
 | city | Ciudad (region) | Proxy geografico |
 | tenure_months | Meses desde enrollment hasta t0 | Antiguedad |
-| cust_active_card_flg | Tiene STORE_CARD credito activo | FLAG STRING Y/N |
+| cust_active_store_card_flg | Tiene STORE_CARD credito activo | FLAG STRING Y/N |
 | cust_active_deb_flg | Tiene debito activo | FLAG STRING Y/N |
 | cust_active_omp_flg | Tiene otro medio de pago | FLAG STRING Y/N |
 | status | ACTIVO/INACTIVO | Actividad en ultimos 365 dias |

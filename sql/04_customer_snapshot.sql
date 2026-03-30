@@ -171,6 +171,8 @@ trx_pre AS (
 
 -- ===========================================================================
 -- CANJES PRE-T0: Toda la historia de canjes hasta t0
+-- ⚠ ASIMETRIA DE VENTANAS: trx_pre usa ventana 12m, canjes_pre toda la historia.
+-- INTENCIONAL: features acumulativas para distinguir y=1 vs y=2.
 -- ===========================================================================
 canjes_pre AS (
   SELECT
@@ -283,9 +285,19 @@ markov_probs AS (
     fp.cust_id,
     fp.t0,
     fp.funnel_state_at_t0,
-    -- Probabilidad de avanzar al siguiente estado positivo
-    COALESCE(MAX(CASE WHEN mt.estado_destino IN ('CANJEADOR', 'RECURRENTE', 'POSIBILIDAD_CANJE')
-                      THEN mt.prob_transicion END), 0) AS prob_to_next_state,
+    -- Probabilidad de avanzar (contextual por estado)
+    COALESCE(
+      CASE fp.funnel_state_at_t0
+        WHEN 'RECURRENTE' THEN
+          1.0 - COALESCE(MAX(CASE WHEN mt.estado_destino = 'FUGA' THEN mt.prob_transicion END), 0)
+        WHEN 'CANJEADOR' THEN
+          COALESCE(MAX(CASE WHEN mt.estado_destino = 'RECURRENTE' THEN mt.prob_transicion END), 0)
+        WHEN 'FUGA' THEN
+          COALESCE(MAX(CASE WHEN mt.estado_destino = 'RECURRENTE' THEN mt.prob_transicion END), 0)
+        ELSE
+          COALESCE(MAX(CASE WHEN mt.estado_destino IN ('CANJEADOR', 'RECURRENTE') THEN mt.prob_transicion END), 0)
+      END,
+    0) AS prob_to_next_state,
     -- Probabilidad de caer a fuga
     COALESCE(MAX(CASE WHEN mt.estado_destino = 'FUGA'
                       THEN mt.prob_transicion END), 0) AS prob_to_fuga
@@ -418,14 +430,21 @@ snapshot_final AS (
     COALESCE(cj.redeem_points_total_pre,   0)                 AS redeem_points_total_pre,
     COALESCE(cj.redeem_count_12m_pre,      0)                 AS redeem_count_12m_pre,
     COALESCE(cj.redeem_points_12m_pre,     0)                 AS redeem_points_12m_pre,
-    SAFE_DIVIDE(
-      COALESCE(cj.redeem_points_total_pre, 0),
-      NULLIF(COALESCE(trx.points_earned_total, 0), 0)
+    -- redeem_rate clipeado a [0,1]
+    LEAST(
+      COALESCE(SAFE_DIVIDE(
+        COALESCE(cj.redeem_points_total_pre, 0),
+        NULLIF(COALESCE(trx.points_earned_total, 0), 0)
+      ), 0),
+      1.0
     )                                                         AS redeem_rate,
-    COALESCE(1 - SAFE_DIVIDE(
-      COALESCE(cj.redeem_points_total_pre, 0),
-      NULLIF(COALESCE(trx.points_earned_total, 0), 0)
-    ), 1)                                                     AS breakage,
+    GREATEST(
+      COALESCE(1 - SAFE_DIVIDE(
+        COALESCE(cj.redeem_points_total_pre, 0),
+        NULLIF(COALESCE(trx.points_earned_total, 0), 0)
+    ), 1),
+      0.0
+    )                                                         AS breakage,
 
     -- -----------------------------------------------------------------------
     -- GRUPO C: DINÁMICAS (velocidad, aceleración, tendencia)

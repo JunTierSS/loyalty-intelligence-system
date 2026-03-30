@@ -53,7 +53,7 @@ Eres un Data Scientist senior construyendo un sistema de inteligencia para el pr
 svw_clients_entity
   cust_id STRING, partition_date DATE, cat_cust_name STRING (tier),
   stock_points_amt FLOAT64, exp_point_current_month_amt FLOAT64,
-  cust_active_card_flg STRING ('Y'/'N'), cust_age_num INT64,
+  cust_active_store_card_flg STRING ('Y'/'N'), cust_age_num INT64,
   cust_gender_desc STRING, cust_enroll_date DATE
 
 -- Transacciones
@@ -164,7 +164,7 @@ y = 2: Canjea Y ya habia canjeado (recurrencia)
 
 **Grupo H (Funnel, 6):** funnel_state_at_t0, days_in_current_state, transitions_last_12m, velocity_in_funnel, prob_to_next_state, prob_to_fuga
 
-**Grupo I (Demograficas, 9):** tier, age, gender, city, tenure_months, cust_active_card_flg, cust_active_deb_flg, cust_active_omp_flg, status
+**Grupo I (Demograficas, 9):** tier, age, gender, city, tenure_months, cust_active_store_card_flg, cust_active_deb_flg, cust_active_omp_flg, status
 
 **Grupo J (Avanzadas, 6):** ratio_earn_redeem, ticket_trend, burstiness, spend_variability, campaign_response_rate, breakage. NOTA: engagement_score REMOVIDO por leakage.
 

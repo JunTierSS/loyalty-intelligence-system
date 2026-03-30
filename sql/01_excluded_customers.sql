@@ -78,16 +78,18 @@ canje_stats AS (
 ),
 
 -- -----------------------------------------------------------------------
--- CRITERIO 1: FANTASMAS — Sin ninguna transacción en todo el periodo
+-- CRITERIO 1: FANTASMAS — Sin ninguna transacción NI canje en todo el periodo
 -- -----------------------------------------------------------------------
 exclusion_fantasmas AS (
   SELECT
     cu.cust_id,
     'FANTASMA'                             AS motivo_exclusion,
-    'Sin transacciones 2022-2026'          AS descripcion
+    'Sin transacciones ni canjes 2022-2026' AS descripcion
   FROM clientes_universo cu
   LEFT JOIN trx_validas t ON cu.cust_id = t.cust_id
+  LEFT JOIN canje_stats cs ON cu.cust_id = cs.cust_id
   WHERE t.cust_id IS NULL
+    AND cs.cust_id IS NULL
 ),
 
 -- -----------------------------------------------------------------------
@@ -129,9 +131,13 @@ exclusion_colaboradores AS (
   SELECT
     cust_id,
     'COLABORADOR'                          AS motivo_exclusion,
-    'Empleado del retail conglomerate'         AS descripcion
-  FROM `my-gcp-discovery.operations.base_colaboradores`
-  -- TODO: Confirmar dataset exacto dentro de my-gcp-discovery
+    'Empleado del retail conglomerate'     AS descripcion
+  -- === OPCIÓN A: Tabla real (descomentar cuando se confirme acceso) ===
+  -- FROM `my-gcp-discovery.operations.base_colaboradores`
+  -- === OPCIÓN B: Fallback vacío (usar si la tabla no existe) ===
+  FROM UNNEST(ARRAY<STRING>[]) AS cust_id
+  -- === OPCIÓN C: Tabla local ===
+  -- FROM `my-gcp-project.loyalty_analytics.base_colaboradores`
 ),
 
 -- -----------------------------------------------------------------------

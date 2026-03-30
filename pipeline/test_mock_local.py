@@ -97,7 +97,7 @@ SELECT
   CASE WHEN sp.client_num % 3 != 0 THEN TRUE ELSE FALSE END AS contact_phone_flg,
   CASE WHEN sp.client_num % 7 = 0 THEN TRUE ELSE FALSE END AS contact_push_flg,
   CASE WHEN sp.cat_cust_name IN ('PREMIUM','ELITE') THEN TRUE
-       WHEN sp.client_num % 3 = 0 THEN TRUE ELSE FALSE END AS cust_active_card_flg,
+       WHEN sp.client_num % 3 = 0 THEN TRUE ELSE FALSE END AS cust_active_store_card_flg,
   CASE WHEN sp.client_num % 4 = 0 THEN TRUE ELSE FALSE END AS cust_active_deb_flg,
   CASE WHEN sp.client_num % 10 = 0 THEN TRUE ELSE FALSE END AS cust_active_omp_flg,
   GREATEST(sp.stock_base + CAST(
@@ -626,7 +626,7 @@ demograficas AS (
     LAST(c.contact_email_flg ORDER BY c.partition_date) AS contact_email_flg,
     LAST(c.contact_phone_flg ORDER BY c.partition_date) AS contact_phone_flg,
     LAST(c.contact_push_flg ORDER BY c.partition_date) AS contact_push_flg,
-    LAST(c.cust_active_card_flg ORDER BY c.partition_date) AS cust_active_card_flg,
+    LAST(c.cust_active_store_card_flg ORDER BY c.partition_date) AS cust_active_store_card_flg,
     LAST(c.cust_active_deb_flg ORDER BY c.partition_date) AS cust_active_deb_flg,
     LAST(c.cust_active_omp_flg ORDER BY c.partition_date) AS cust_active_omp_flg,
     LAST(c.cust_stock_point_amt ORDER BY c.partition_date) AS stock_points_at_t0,
@@ -778,7 +778,7 @@ snapshot_final AS (
     UPPER(COALESCE(d.tier, mu.tier_actual)) AS tier,
     DATE_DIFF('month', COALESCE(CAST(d.enrollment_date AS DATE), mu.enrollment_date), CAST(b.t0 AS DATE)) AS tenure_months,
     d.gender, d.age, d.city,
-    d.cust_active_card_flg, d.cust_active_deb_flg, d.cust_active_omp_flg,
+    d.cust_active_store_card_flg, d.cust_active_deb_flg, d.cust_active_omp_flg,
     COALESCE(d.contact_email_flg, FALSE) AS contact_email_flg,
     COALESCE(d.contact_phone_flg, FALSE) AS contact_phone_flg,
     COALESCE(d.contact_push_flg, FALSE) AS contact_push_flg,

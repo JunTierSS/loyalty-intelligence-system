@@ -142,7 +142,7 @@ SELECT
   CASE WHEN MOD(sb.client_num, 7) = 0 THEN TRUE ELSE FALSE END AS contact_push_flg,
   -- Productos activos
   CASE WHEN sb.cat_cust_name IN ('PREMIUM', 'ELITE') THEN TRUE
-       WHEN MOD(sb.client_num, 3) = 0 THEN TRUE ELSE FALSE END AS cust_active_card_flg,
+       WHEN MOD(sb.client_num, 3) = 0 THEN TRUE ELSE FALSE END AS cust_active_store_card_flg,
   CASE WHEN MOD(sb.client_num, 4) = 0 THEN TRUE ELSE FALSE END AS cust_active_deb_flg,
   CASE WHEN MOD(sb.client_num, 10) = 0 THEN TRUE ELSE FALSE END AS cust_active_omp_flg,
   -- Stock de puntos: crece con el tiempo
