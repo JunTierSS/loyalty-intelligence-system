@@ -245,21 +245,35 @@ funnel_with_lag AS (
   FROM `my-gcp-project.loyalty_intelligence.funnel_states_monthly` fs
 ),
 
+-- Grupo de consecutividad: incrementa cada vez que cambia de estado
+funnel_consecutive AS (
+  SELECT
+    fl.cust_id,
+    fl.fecha_fin_mes,
+    fl.funnel_state,
+    SUM(CASE WHEN fl.funnel_state != fl.prev_funnel_state
+              AND fl.prev_funnel_state IS NOT NULL THEN 1 ELSE 0 END)
+      OVER (PARTITION BY fl.cust_id ORDER BY fl.fecha_fin_mes
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS state_group
+  FROM funnel_with_lag fl
+),
+
 -- NOTE: funnel_states_monthly is pre-computed over the full date range.
--- The JOIN condition (fecha_fin_mes < t0) ensures only pre-t0 states are used,
--- but the underlying funnel state computation sees all historical transactions.
--- See 03_markov_transition_matrix.sql for details on this structural limitation.
+-- The JOIN condition (fecha_fin_mes < t0) ensures only pre-t0 states are used.
 funnel_pre AS (
   SELECT
     b.cust_id,
     b.t0,
-    -- Estado en el último día del mes anterior a t0
     MAX_BY(fl.funnel_state,        fl.fecha_fin_mes)  AS funnel_state_at_t0,
     MAX_BY(fl.total_canjes,        fl.fecha_fin_mes)  AS total_canjes_at_t0,
     MAX_BY(fl.total_compras,       fl.fecha_fin_mes)  AS total_compras_at_t0,
-    -- Meses en estado actual (conteo consecutivo del estado más reciente)
-    COUNT(DISTINCT CASE WHEN fl.funnel_state = MAX_BY(fl.funnel_state, fl.fecha_fin_mes)
-                        THEN fl.fecha_fin_mes END)    AS months_in_current_state,
+    -- Meses CONSECUTIVOS en estado actual (cuenta meses en el mismo state_group)
+    (SELECT COUNT(*)
+     FROM funnel_consecutive fc2
+     WHERE fc2.cust_id = b.cust_id
+       AND fc2.fecha_fin_mes < b.t0
+       AND fc2.state_group = MAX_BY(fc.state_group, fc.fecha_fin_mes)
+    )                                                 AS months_in_current_state,
     -- Transiciones en últimos 12m (cambios de estado mes a mes)
     COUNTIF(fl.funnel_state != fl.prev_funnel_state
         AND fl.prev_funnel_state IS NOT NULL)         AS transitions_last_12m,
@@ -274,6 +288,10 @@ funnel_pre AS (
     ON  fl.cust_id       = b.cust_id
     AND fl.fecha_fin_mes  < b.t0
     AND fl.fecha_fin_mes >= DATE_SUB(b.t0, INTERVAL 13 MONTH)
+  JOIN funnel_consecutive fc
+    ON  fc.cust_id       = b.cust_id
+    AND fc.fecha_fin_mes  < b.t0
+    AND fc.fecha_fin_mes >= DATE_SUB(b.t0, INTERVAL 13 MONTH)
   GROUP BY b.cust_id, b.t0
 ),
 
